@@ -37,7 +37,13 @@ const api: StatusPillPreloadApi = {
   getInitialPreferences: (): Promise<StatusPillPreferences> =>
     ipcRenderer.invoke('statusPill:getInitialPreferences'),
   answerQuestion: (paneKey: string, raw: string): Promise<StatusPillAnswerResult> =>
-    ipcRenderer.invoke('statusPill:answerAgent', { paneKey, raw })
+    ipcRenderer.invoke('statusPill:answerAgent', { paneKey, raw }),
+  resize: (width: number, height: number): void => {
+    ipcRenderer.send('statusPill:resize', { width, height })
+  },
+  setInteractive: (interactive: boolean): void => {
+    ipcRenderer.send('statusPill:setInteractive', interactive)
+  }
 }
 
 // Why: the status-pill renderer is the only surface this preload bridges, so

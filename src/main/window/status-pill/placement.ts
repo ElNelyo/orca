@@ -73,17 +73,23 @@ export function pickDisplayForCursor(
   return displays.find((d) => d.internal) ?? displays[0]
 }
 
-/** Compute the pill's screen rectangle for the chosen display + platform. */
+/** Compute the pill window's screen rectangle for the chosen display + platform.
+ *  The rectangle covers the *window* (capsule + padding), so the capsule body
+ *  is centered inside the returned bounds and the box-shadow halo has room to
+ *  render outside the capsule without being clipped by the BrowserWindow. */
 export function computeStatusPillPlacement(input: StatusPillPlacementInput): StatusPillPlacement {
   const { pillWidth, pillHeight, display, platform, pinnedXOffset } = input
   const workArea = display.workArea
 
-  // Why: horizontal placement is either user-pinned (within bounds) or centered
-  // in the work area. Centering mirrors Vibe Island's notch anchor when the
-  // display has a notch and looks correct on plain top-center platforms too.
-  const centerX = workArea.x + Math.round((workArea.width - pillWidth) / 2)
+  // Why: window = capsule + horizontal padding, so the capsule stays centered
+  // and the shadow halo has room on each side. Centering uses the WINDOW
+  // width so the visible capsule ends up visually centered on the display.
+  const windowWidth = pillWidth + PILL_WINDOW_PADDING_X * 2
+  const windowHeight = pillHeight + PILL_WINDOW_PADDING_TOP + PILL_WINDOW_PADDING_BOTTOM
+
+  const centerX = workArea.x + Math.round((workArea.width - windowWidth) / 2)
   const minX = workArea.x + TOP_GAP_NO_NOTCH
-  const maxX = workArea.x + workArea.width - pillWidth - TOP_GAP_NO_NOTCH
+  const maxX = workArea.x + workArea.width - windowWidth - TOP_GAP_NO_NOTCH
   const resolvedX =
     typeof pinnedXOffset === 'number'
       ? clamp(pinnedXOffset, minX, maxX)
@@ -94,10 +100,18 @@ export function computeStatusPillPlacement(input: StatusPillPlacementInput): Sta
   return {
     x: resolvedX,
     y,
-    width: pillWidth,
-    height: pillHeight
+    width: windowWidth,
+    height: windowHeight
   }
 }
+
+/** Window-level padding exported so the renderer can mirror the values in
+ *  its own CSS (the .pill-stack wrapper inset must match for the capsule to
+ *  visually center inside the window). Kept here so placement math + CSS
+ *  layout can never drift apart. */
+export const PILL_WINDOW_PADDING_X = 18
+export const PILL_WINDOW_PADDING_TOP = 6
+export const PILL_WINDOW_PADDING_BOTTOM = 34
 
 function computeTopY(args: {
   platform: NodeJS.Platform

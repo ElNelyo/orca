@@ -1,6 +1,6 @@
 import './pill.css'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import type {
   StatusPillAgentRow,
@@ -13,6 +13,14 @@ import { EMPTY_STATUS_PILL_SUMMARY } from '../../shared/status-pill-preload-api'
 import { AgentRowView } from './agent-row'
 import { PendingQuestionCard } from './pending-question-card'
 import { buildPanelTitle, pickTone, type Tone } from './status-pill-formatters'
+
+// Why: mirror the main-side PILL_WINDOW_PADDING_* constants (placement.ts) so
+// the renderer-side window size sent via statusPill:resize accounts for the
+// shadow halo. They are duplicated (not imported) because the placement
+// module imports Electron types that the renderer sandbox cannot see.
+const PILL_RENDERER_PADDING_X = 18
+const PILL_RENDERER_PADDING_TOP = 6
+const PILL_RENDERER_PADDING_BOTTOM = 34
 
 declare global {
   // oxlint-disable-next-line typescript-eslint/consistent-type-definitions -- declaration merging requires interface
@@ -34,6 +42,10 @@ function StatusPill(): React.JSX.Element {
   const [entered, setEntered] = useState(false)
   const [answeringPaneKey, setAnsweringPaneKey] = useState<string | null>(null)
   const [answerError, setAnswerError] = useState<string | null>(null)
+
+  // Why: keep a stable ref to the pill-stack so the ResizeObserver can
+  // re-attach without re-creating the observer on every render.
+  const stackRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     if (!api) {
@@ -133,6 +145,76 @@ function StatusPill(): React.JSX.Element {
     document.documentElement.classList.toggle('dark', isDark)
   }, [preferences?.shouldUseDarkColors])
 
+  // Why: measure the live .pill-stack size and ask main to resize the
+  // BrowserWindow so the capsule + expanded panel always have room to render
+  // without clipping. Grow immediately, shrink on a 250 ms delay so the CSS
+  // collapse animation has time to finish before the window shrinks (avoids
+  // one-frame flicker where the panel content gets cut mid-animation).
+  useEffect(() => {
+    if (!api || !stackRef.current) {
+      return
+    }
+    const element = stackRef.current
+    let lastWidth = 0
+    let lastHeight = 0
+    let shrinkTimer: ReturnType<typeof setTimeout> | null = null
+    const flush = (width: number, height: number): void => {
+      if (width === lastWidth && height === lastHeight) {
+        return
+      }
+      lastWidth = width
+      lastHeight = height
+      api.resize(width, height)
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (!entry) {
+        return
+      }
+      // Why: include the content rect + the renderer-side padding (CSS pixels
+      // matching the main-side PILL_WINDOW_PADDING_* constants) so the
+      // shadow halo still has room when the window grows.
+      const nextWidth = Math.ceil(entry.contentRect.width + PILL_RENDERER_PADDING_X * 2)
+      const nextHeight = Math.ceil(
+        entry.contentRect.height + PILL_RENDERER_PADDING_TOP + PILL_RENDERER_PADDING_BOTTOM
+      )
+      const growing = nextWidth > lastWidth || nextHeight > lastHeight
+      if (shrinkTimer !== null) {
+        clearTimeout(shrinkTimer)
+        shrinkTimer = null
+      }
+      if (growing) {
+        flush(nextWidth, nextHeight)
+      } else {
+        // Why: delay the shrink so the panel's CSS collapse animation
+        // completes before the window clips its bounds.
+        shrinkTimer = setTimeout(() => {
+          shrinkTimer = null
+          flush(nextWidth, nextHeight)
+        }, 260)
+      }
+    })
+    observer.observe(element)
+    return () => {
+      observer.disconnect()
+      if (shrinkTimer !== null) {
+        clearTimeout(shrinkTimer)
+        shrinkTimer = null
+      }
+    }
+  }, [api])
+
+  // Why: default window state is click-through (setIgnoreMouseEvents true on
+  // transparent pixels). When the cursor enters the interactive region, tell
+  // main to disable click-through so the capsule/buttons receive mouse
+  // events normally. On leave, re-enable click-through.
+  const onStackMouseEnter = (): void => {
+    api?.setInteractive(true)
+  }
+  const onStackMouseLeave = (): void => {
+    api?.setInteractive(false)
+  }
+
   const tone = pickTone(summary)
   const pulse =
     preferences?.prefersReducedMotion !== true &&
@@ -158,9 +240,16 @@ function StatusPill(): React.JSX.Element {
 
   return (
     <div
+      ref={stackRef}
       className={`pill-stack ${entered ? 'pill-enter' : ''}`}
-      onMouseEnter={() => setExpanded(true)}
-      onMouseLeave={() => setExpanded(false)}
+      onMouseEnter={() => {
+        setExpanded(true)
+        onStackMouseEnter()
+      }}
+      onMouseLeave={() => {
+        setExpanded(false)
+        onStackMouseLeave()
+      }}
     >
       <PillBody
         tone={tone}
@@ -321,7 +410,8 @@ function StyleBaseline(): React.JSX.Element {
         flex-direction: column;
         align-items: center;
         gap: 8px;
-        padding-top: 6px;
+        width: max-content;
+        max-width: 460px;
       }
     `}</style>
   )

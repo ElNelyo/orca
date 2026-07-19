@@ -33,25 +33,31 @@ describe('computeStatusPillPlacement', () => {
     const display = makeDisplay()
     const placement = computeStatusPillPlacement({
       pillWidth: 320,
-      pillHeight: 32,
+      pillHeight: 34,
       display,
       platform: 'linux'
     })
-    expect(placement.x).toBe(Math.round((1920 - 320) / 2))
+    // Why: the placement returns the *window* rectangle, which is the capsule
+    // plus PILL_PADDING_X (18) on each side = 356 wide, and 34 + 6 + 34 = 74
+    // tall. Centering uses the window width so the capsule ends up visually
+    // centered on the display.
+    const expectedWindowWidth = 320 + 18 * 2
+    const expectedWindowHeight = 34 + 6 + 34
+    expect(placement.x).toBe(Math.round((1920 - expectedWindowWidth) / 2))
     expect(placement.y).toBe(8)
-    expect(placement.width).toBe(320)
-    expect(placement.height).toBe(32)
+    expect(placement.width).toBe(expectedWindowWidth)
+    expect(placement.height).toBe(expectedWindowHeight)
   })
 
   it('centers horizontally on Windows with an 8px top gap', () => {
     const display = makeDisplay()
     const placement = computeStatusPillPlacement({
       pillWidth: 320,
-      pillHeight: 32,
+      pillHeight: 34,
       display,
       platform: 'win32'
     })
-    expect(placement.x).toBe(Math.round((1920 - 320) / 2))
+    expect(placement.x).toBe(Math.round((1920 - (320 + 18 * 2)) / 2))
     expect(placement.y).toBe(8)
   })
 
@@ -66,7 +72,7 @@ describe('computeStatusPillPlacement', () => {
     ;(display as Display & { safeArea?: { y: number } }).safeArea = { y: 38 }
     const placement = computeStatusPillPlacement({
       pillWidth: 320,
-      pillHeight: 32,
+      pillHeight: 34,
       display,
       platform: 'darwin'
     })
@@ -79,7 +85,7 @@ describe('computeStatusPillPlacement', () => {
     })
     const placement = computeStatusPillPlacement({
       pillWidth: 320,
-      pillHeight: 32,
+      pillHeight: 34,
       display,
       platform: 'darwin'
     })
@@ -92,7 +98,7 @@ describe('computeStatusPillPlacement', () => {
     })
     const placement = computeStatusPillPlacement({
       pillWidth: 320,
-      pillHeight: 32,
+      pillHeight: 34,
       display,
       platform: 'darwin'
     })
@@ -105,7 +111,7 @@ describe('computeStatusPillPlacement', () => {
     })
     const placement = computeStatusPillPlacement({
       pillWidth: 320,
-      pillHeight: 32,
+      pillHeight: 34,
       display,
       platform: 'linux',
       pinnedXOffset: 200
@@ -119,12 +125,14 @@ describe('computeStatusPillPlacement', () => {
     })
     const placement = computeStatusPillPlacement({
       pillWidth: 320,
-      pillHeight: 32,
+      pillHeight: 34,
       display,
       platform: 'linux',
       pinnedXOffset: 50000
     })
-    expect(placement.x).toBe(100 + 1000 - 320 - 8)
+    // Why: clamp against the WINDOW width (capsule + padding) so the entire
+    // BrowserWindow stays inside the work area.
+    expect(placement.x).toBe(100 + 1000 - (320 + 18 * 2) - 8)
   })
 
   it('falls back to NaN-safe minX when pinnedXOffset is not finite', () => {
@@ -133,7 +141,7 @@ describe('computeStatusPillPlacement', () => {
     })
     const placement = computeStatusPillPlacement({
       pillWidth: 320,
-      pillHeight: 32,
+      pillHeight: 34,
       display,
       platform: 'linux',
       pinnedXOffset: Number.NaN

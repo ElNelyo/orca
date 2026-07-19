@@ -151,4 +151,13 @@ export type StatusPillPreloadApi = {
    *  reached a live terminal. Main resolves the paneKey → terminal handle →
    *  runtime.sendTerminal path, so the pill renderer never needs ptyId. */
   answerQuestion: (paneKey: string, raw: string) => Promise<StatusPillAnswerResult>
+  /** Ask main to resize the pill BrowserWindow so the renderer content (which
+   *  just expanded/collapsed) fits without clipping. Main keeps the window
+   *  centered on the same display. */
+  resize: (width: number, height: number) => void
+  /** Toggle click-through on the pill window. When false (default), the
+   *  transparent padding around the capsule passes clicks to apps behind.
+   *  Set true while the cursor is over the capsule / panel / buttons so they
+   *  receive mouse events normally. */
+  setInteractive: (interactive: boolean) => void
 }

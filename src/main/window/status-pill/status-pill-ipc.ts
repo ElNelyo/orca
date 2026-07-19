@@ -63,8 +63,71 @@ export function attachStatusPillIpcListeners(args: StatusPillIpcArgs): () => voi
   const answerHandler = async (payload: unknown): Promise<StatusPillAnswerResult> =>
     answerAgentFromPill(payload, args)
 
+  const resizeHandler = (payload: unknown): void => {
+    // Why: when the pill expands/collapses, the renderer measures the new
+    // content size and asks main to resize the window so the panel doesn't
+    // get clipped. Main keeps the window centered horizontally on the same
+    // display (current_center_x - new_width/2) so the capsule visually stays
+    // anchored on the same spot.
+    if (!payload || typeof payload !== 'object') {
+      return
+    }
+    const { width, height } = payload as { width?: unknown; height?: unknown }
+    if (typeof width !== 'number' || typeof height !== 'number') {
+      return
+    }
+    if (!Number.isFinite(width) || !Number.isFinite(height)) {
+      return
+    }
+    if (args.window.isDestroyed()) {
+      return
+    }
+    try {
+      const current = args.window.getBounds()
+      const nextWidth = Math.round(width)
+      const nextHeight = Math.round(height)
+      // Why: keep the same center x so the capsule appears to grow/shrink
+      // symmetrically. Y stays at the top so the pill stays anchored at the
+      // top of the screen.
+      const currentCenterX = current.x + Math.round(current.width / 2)
+      const nextX = currentCenterX - Math.round(nextWidth / 2)
+      args.window.setBounds(
+        {
+          x: nextX,
+          y: current.y,
+          width: nextWidth,
+          height: nextHeight
+        },
+        false
+      )
+    } catch (error) {
+      args.warn('[status-pill] resize failed', error)
+    }
+  }
+
+  const setInteractiveHandler = (payload: unknown): void => {
+    // Why: toggle setIgnoreMouseEvents so transparent padding pixels pass
+    // clicks through to apps behind the overlay (default), while interactive
+    // regions (capsule, panel, buttons) capture them when hovered.
+    const interactive = payload === true
+    if (args.window.isDestroyed()) {
+      return
+    }
+    try {
+      args.window.setIgnoreMouseEvents(!interactive, { forward: true })
+    } catch {
+      try {
+        args.window.setIgnoreMouseEvents(!interactive)
+      } catch {
+        // Best-effort; older Electron versions or headless test environments.
+      }
+    }
+  }
+
   ipcMain.on('statusPill:click', clickHandler)
   ipcMain.on('statusPill:contextMenu', contextMenuHandler)
+  ipcMain.on('statusPill:resize', resizeHandler)
+  ipcMain.on('statusPill:setInteractive', setInteractiveHandler)
   ipcMain.handle('statusPill:getSnapshot', snapshotHandler)
   ipcMain.handle('statusPill:getAgentRows', rowsHandler)
   ipcMain.handle('statusPill:getInitialPreferences', prefsHandler)
@@ -73,6 +136,8 @@ export function attachStatusPillIpcListeners(args: StatusPillIpcArgs): () => voi
   return () => {
     ipcMain.removeListener('statusPill:click', clickHandler)
     ipcMain.removeListener('statusPill:contextMenu', contextMenuHandler)
+    ipcMain.removeListener('statusPill:resize', resizeHandler)
+    ipcMain.removeListener('statusPill:setInteractive', setInteractiveHandler)
     ipcMain.removeHandler('statusPill:getSnapshot')
     ipcMain.removeHandler('statusPill:getAgentRows')
     ipcMain.removeHandler('statusPill:getInitialPreferences')
