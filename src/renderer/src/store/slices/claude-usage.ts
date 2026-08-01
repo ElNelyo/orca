@@ -3,6 +3,7 @@ import type {
   ClaudeUsageBreakdownRow,
   ClaudeUsageDailyPoint,
   ClaudeUsageRange,
+  ClaudeUsageRemoteScanResult,
   ClaudeUsageScanState,
   ClaudeUsageScope,
   ClaudeUsageSessionRow,
@@ -20,10 +21,16 @@ export type ClaudeUsageSlice = {
   claudeUsageModelBreakdown: ClaudeUsageBreakdownRow[]
   claudeUsageProjectBreakdown: ClaudeUsageBreakdownRow[]
   claudeUsageRecentSessions: ClaudeUsageSessionRow[]
+  claudeUsageRemoteConnectionId: string | null
+  claudeUsageRemoteSnapshot: ClaudeUsageSnapshot | null
+  claudeUsageRemoteError: string | null
+  claudeUsageRemoteScanning: boolean
   setClaudeUsageEnabled: (enabled: boolean) => Promise<void>
   setClaudeUsageScope: (scope: ClaudeUsageScope) => Promise<void>
   setClaudeUsageRange: (range: ClaudeUsageRange) => Promise<void>
   fetchClaudeUsage: (opts?: { forceRefresh?: boolean }) => Promise<void>
+  fetchClaudeUsageRemote: (connectionId: string) => Promise<void>
+  clearClaudeUsageRemote: () => void
   enableClaudeUsage: () => Promise<void>
   refreshClaudeUsage: () => Promise<void>
 }
@@ -40,6 +47,10 @@ export const createClaudeUsageSlice: StateCreator<AppState, [], [], ClaudeUsageS
   claudeUsageModelBreakdown: [],
   claudeUsageProjectBreakdown: [],
   claudeUsageRecentSessions: [],
+  claudeUsageRemoteConnectionId: null,
+  claudeUsageRemoteSnapshot: null,
+  claudeUsageRemoteError: null,
+  claudeUsageRemoteScanning: false,
 
   setClaudeUsageEnabled: async (enabled) => {
     try {
@@ -75,11 +86,17 @@ export const createClaudeUsageSlice: StateCreator<AppState, [], [], ClaudeUsageS
   setClaudeUsageScope: async (scope) => {
     set({ claudeUsageScope: scope })
     await get().fetchClaudeUsage()
+    if (get().claudeUsageRemoteConnectionId) {
+      await get().fetchClaudeUsageRemote(get().claudeUsageRemoteConnectionId as string)
+    }
   },
 
   setClaudeUsageRange: async (range) => {
     set({ claudeUsageRange: range })
     await get().fetchClaudeUsage()
+    if (get().claudeUsageRemoteConnectionId) {
+      await get().fetchClaudeUsageRemote(get().claudeUsageRemoteConnectionId as string)
+    }
   },
 
   fetchClaudeUsage: async (opts) => {
@@ -164,5 +181,44 @@ export const createClaudeUsageSlice: StateCreator<AppState, [], [], ClaudeUsageS
 
   refreshClaudeUsage: async () => {
     await get().fetchClaudeUsage({ forceRefresh: true })
+  },
+
+  fetchClaudeUsageRemote: async (connectionId) => {
+    set({
+      claudeUsageRemoteConnectionId: connectionId,
+      claudeUsageRemoteScanning: true,
+      claudeUsageRemoteError: null,
+      claudeUsageRemoteSnapshot: null
+    })
+    try {
+      const { claudeUsageScope, claudeUsageRange } = get()
+      const result = (await window.api.claudeUsage.scanRemote({
+        connectionId,
+        scope: claudeUsageScope,
+        range: claudeUsageRange
+      })) as ClaudeUsageRemoteScanResult
+      if (result.ok) {
+        set({
+          claudeUsageRemoteSnapshot: result.snapshot,
+          claudeUsageRemoteScanning: false
+        })
+      } else {
+        set({ claudeUsageRemoteError: result.error, claudeUsageRemoteScanning: false })
+      }
+    } catch (error) {
+      set({
+        claudeUsageRemoteError: error instanceof Error ? error.message : String(error),
+        claudeUsageRemoteScanning: false
+      })
+    }
+  },
+
+  clearClaudeUsageRemote: () => {
+    set({
+      claudeUsageRemoteConnectionId: null,
+      claudeUsageRemoteSnapshot: null,
+      claudeUsageRemoteError: null,
+      claudeUsageRemoteScanning: false
+    })
   }
 })

@@ -3382,7 +3382,11 @@
           "rangeLast7Days": "过去 7 天",
           "rangeLast30Days": "过去 30 天",
           "rangeLast90Days": "过去 90 天",
-          "rangeAllTime": "全部时间"
+          "rangeAllTime": "全部时间",
+          "remoteServerPrefix": "Remote server",
+          "remoteSourceLabel": "Usage source",
+          "thisMachine": "This machine",
+          "noConnectedServers": "No connected remote server. Connect an SSH target to scan its usage."
         },
         "CodexUsageDailyChart": {
           "1e6f62d7e3": "推理",

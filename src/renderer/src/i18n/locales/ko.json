@@ -3382,7 +3382,11 @@
           "rangeLast7Days": "최근 7일",
           "rangeLast30Days": "최근 30일",
           "rangeLast90Days": "최근 90일",
-          "rangeAllTime": "전체 기간"
+          "rangeAllTime": "전체 기간",
+          "remoteServerPrefix": "Remote server",
+          "remoteSourceLabel": "Usage source",
+          "thisMachine": "This machine",
+          "noConnectedServers": "No connected remote server. Connect an SSH target to scan its usage."
         },
         "CodexUsageDailyChart": {
           "1e6f62d7e3": "추론",

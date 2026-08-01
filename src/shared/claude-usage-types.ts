@@ -70,3 +70,9 @@ export type ClaudeUsageSnapshot = {
   projectBreakdown: ClaudeUsageBreakdownRow[]
   recentSessions: ClaudeUsageSessionRow[]
 }
+
+// Why: remote scans run over SSH on demand; the result is an in-memory snapshot
+// (no persistence) plus an error channel for dropped connections.
+export type ClaudeUsageRemoteScanResult =
+  | { ok: true; snapshot: ClaudeUsageSnapshot }
+  | { ok: false; error: string }

@@ -26,6 +26,10 @@ import { registerRuntimeHandlers } from './runtime'
 import { registerRuntimeEnvironmentHandlers } from './runtime-environments'
 import { registerEphemeralVmHandlers } from './ephemeral-vm'
 import { registerAiVaultHandlers } from './ai-vault'
+import { getActiveSshAiVaultHostInfo } from './ssh'
+import { getSshFilesystemProvider } from '../providers/ssh-filesystem-dispatch'
+import { loadRemoteUsageWorktreesForConnection } from '../usage-worktree-metadata'
+import { createWorktreeRefs } from '../claude-usage/scanner'
 import { registerNativeChatHandlers } from './native-chat'
 import { registerNotificationHandlers } from './notifications'
 import { registerNotebookHandlers } from './notebook'
@@ -132,7 +136,25 @@ export function registerCoreHandlers(
   registerAppHandlers(store, { onBeforeRelaunch: lifecycleOptions.onBeforeRelaunch })
   registerCliHandlers()
   registerPreflightHandlers()
-  registerClaudeUsageHandlers(claudeUsage)
+  registerClaudeUsageHandlers(claudeUsage, {
+    resolveRemoteScanContext: (connectionId) => {
+      const provider = getSshFilesystemProvider(connectionId)
+      const hostInfo = getActiveSshAiVaultHostInfo(connectionId)
+      if (!provider || !hostInfo) {
+        return null
+      }
+      const repos = store.getRepos()
+      const remoteRepos = repos.filter((repo) => repo.connectionId === connectionId)
+      const worktreesByRepo = loadRemoteUsageWorktreesForConnection(store, repos, connectionId)
+      return {
+        executionHostId: hostInfo.executionHostId,
+        provider,
+        remoteHome: hostInfo.remoteHome,
+        hostPlatform: hostInfo.hostPlatform,
+        worktrees: createWorktreeRefs(remoteRepos, worktreesByRepo)
+      }
+    }
+  })
   registerCodexUsageHandlers(codexUsage)
   registerOpenCodeUsageHandlers(openCodeUsage)
   registerCodexAccountHandlers(codexAccounts)

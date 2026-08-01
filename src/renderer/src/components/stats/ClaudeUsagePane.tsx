@@ -1,16 +1,13 @@
-import { useEffect } from 'react'
-import {
-  Activity,
-  Coins,
-  DatabaseZap,
-  FolderKanban,
-  Gauge,
-  RefreshCw,
-  SlidersHorizontal,
-  Sparkles,
-  Waypoints
-} from 'lucide-react'
-import type { ClaudeUsageRange, ClaudeUsageScope } from '../../../../shared/claude-usage-types'
+import { useEffect, useState } from 'react'
+import { RefreshCw, Server, SlidersHorizontal } from 'lucide-react'
+import type {
+  ClaudeUsageBreakdownRow,
+  ClaudeUsageDailyPoint,
+  ClaudeUsageRange,
+  ClaudeUsageScope,
+  ClaudeUsageSessionRow,
+  ClaudeUsageSummary
+} from '../../../../shared/claude-usage-types'
 import { useAppStore } from '../../store'
 import { Button } from '../ui/button'
 import {
@@ -25,9 +22,9 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
 import { ClaudeUsageDetails } from './ClaudeUsageDetails'
 import { ClaudeUsageLoadingState } from './ClaudeUsageLoadingState'
+import { ClaudeUsageStatCards } from './ClaudeUsageStatCards'
 import { ShareUsageButton } from './ShareUsageButton'
-import { StatCard } from './StatCard'
-import { formatCost, formatTokens, formatUpdatedAt } from './usage-formatters'
+import { formatUpdatedAt } from './usage-formatters'
 import { translate } from '@/i18n/i18n'
 
 const RANGE_OPTIONS: ClaudeUsageRange[] = ['7d', '30d', '90d', 'all']
@@ -60,13 +57,18 @@ const RANGE_LABELS: Record<ClaudeUsageRange, string> = {
   }
 }
 
+type RemoteTarget = {
+  id: string
+  label: string
+}
+
 export function ClaudeUsagePane(): React.JSX.Element {
-  const scanState = useAppStore((state) => state.claudeUsageScanState)
-  const summary = useAppStore((state) => state.claudeUsageSummary)
-  const daily = useAppStore((state) => state.claudeUsageDaily)
-  const modelBreakdown = useAppStore((state) => state.claudeUsageModelBreakdown)
-  const projectBreakdown = useAppStore((state) => state.claudeUsageProjectBreakdown)
-  const recentSessions = useAppStore((state) => state.claudeUsageRecentSessions)
+  const localScanState = useAppStore((state) => state.claudeUsageScanState)
+  const localSummary = useAppStore((state) => state.claudeUsageSummary)
+  const localDaily = useAppStore((state) => state.claudeUsageDaily)
+  const localModelBreakdown = useAppStore((state) => state.claudeUsageModelBreakdown)
+  const localProjectBreakdown = useAppStore((state) => state.claudeUsageProjectBreakdown)
+  const localRecentSessions = useAppStore((state) => state.claudeUsageRecentSessions)
   const scope = useAppStore((state) => state.claudeUsageScope)
   const range = useAppStore((state) => state.claudeUsageRange)
   const fetchClaudeUsage = useAppStore((state) => state.fetchClaudeUsage)
@@ -75,17 +77,86 @@ export function ClaudeUsagePane(): React.JSX.Element {
   const setClaudeUsageScope = useAppStore((state) => state.setClaudeUsageScope)
   const setClaudeUsageRange = useAppStore((state) => state.setClaudeUsageRange)
   const recordFeatureInteraction = useAppStore((state) => state.recordFeatureInteraction)
+  const remoteConnectionId = useAppStore((state) => state.claudeUsageRemoteConnectionId)
+  const remoteSnapshot = useAppStore((state) => state.claudeUsageRemoteSnapshot)
+  const remoteError = useAppStore((state) => state.claudeUsageRemoteError)
+  const remoteScanning = useAppStore((state) => state.claudeUsageRemoteScanning)
+  const fetchClaudeUsageRemote = useAppStore((state) => state.fetchClaudeUsageRemote)
+  const clearClaudeUsageRemote = useAppStore((state) => state.clearClaudeUsageRemote)
+
+  const [remoteTargets, setRemoteTargets] = useState<RemoteTarget[]>([])
 
   useEffect(() => {
     void fetchClaudeUsage()
   }, [fetchClaudeUsage])
+
+  // Why: only connected SSH targets can be scanned remotely, so resolve their
+  // live connection status on mount rather than offering stale/disconnected hosts.
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const targets = await window.api.ssh.listTargets()
+        const resolved = await Promise.all(
+          targets
+            .filter((target) => !target.owner)
+            .map(async (target) => {
+              const connectionState = await window.api.ssh.getState({ targetId: target.id })
+              return {
+                id: target.id,
+                label: target.label || target.host,
+                connected: connectionState?.status === 'connected'
+              }
+            })
+        )
+        if (cancelled) {
+          return
+        }
+        setRemoteTargets(resolved.filter((target) => target.connected))
+      } catch {
+        if (!cancelled) {
+          setRemoteTargets([])
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const isRemote = remoteConnectionId !== null
+  const summary: ClaudeUsageSummary | null = isRemote ? (remoteSnapshot?.summary ?? null) : localSummary
+  const daily: ClaudeUsageDailyPoint[] = isRemote ? (remoteSnapshot?.daily ?? []) : localDaily
+  const modelBreakdown: ClaudeUsageBreakdownRow[] = isRemote
+    ? (remoteSnapshot?.modelBreakdown ?? [])
+    : localModelBreakdown
+  const projectBreakdown: ClaudeUsageBreakdownRow[] = isRemote
+    ? (remoteSnapshot?.projectBreakdown ?? [])
+    : localProjectBreakdown
+  const recentSessions: ClaudeUsageSessionRow[] = isRemote
+    ? (remoteSnapshot?.recentSessions ?? [])
+    : localRecentSessions
+  const isScanning = isRemote ? remoteScanning : (localScanState?.isScanning ?? false)
+  const lastScanError = isRemote ? remoteError : (localScanState?.lastScanError ?? null)
+  const lastScanCompletedAt = isRemote
+    ? (remoteSnapshot?.scanState.lastScanCompletedAt ?? null)
+    : (localScanState?.lastScanCompletedAt ?? null)
 
   const handleSetEnabled = (enabled: boolean): void => {
     recordFeatureInteraction('usage-tracking')
     void setClaudeUsageEnabled(enabled)
   }
 
-  if (!scanState?.enabled) {
+  const handleRemoteTargetChange = (nextConnectionId: string): void => {
+    recordFeatureInteraction('usage-tracking')
+    if (nextConnectionId === '') {
+      clearClaudeUsageRemote()
+      return
+    }
+    void fetchClaudeUsageRemote(nextConnectionId)
+  }
+
+  if (!localScanState?.enabled) {
     return (
       <div className="rounded-lg border border-border/60 bg-card/40 p-4">
         <div className="flex items-start justify-between gap-4">
@@ -121,11 +192,19 @@ export function ClaudeUsagePane(): React.JSX.Element {
     )
   }
 
-  if (!summary && (scanState.isScanning || scanState.lastScanCompletedAt === null)) {
+  if (
+    !isRemote &&
+    !localSummary &&
+    (localScanState.isScanning || localScanState.lastScanCompletedAt === null)
+  ) {
     return <ClaudeUsageLoadingState />
   }
 
-  const hasAnyData = summary?.hasAnyClaudeData ?? scanState.hasAnyClaudeData
+  if (isRemote && remoteScanning && !remoteSnapshot) {
+    return <ClaudeUsageLoadingState />
+  }
+
+  const hasAnyData = summary?.hasAnyClaudeData ?? false
 
   return (
     <div className="space-y-4 rounded-lg border border-border/60 bg-card/30 p-4">
@@ -135,12 +214,14 @@ export function ClaudeUsagePane(): React.JSX.Element {
             {translate('auto.components.stats.ClaudeUsagePane.6afacbee37', 'Claude Usage Tracking')}
           </h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            {formatUpdatedAt(scanState.lastScanCompletedAt)}
-            {scanState.lastScanError
+            {isRemote
+              ? translate('auto.components.stats.ClaudeUsagePane.remoteServerPrefix', 'Remote server')
+              : formatUpdatedAt(lastScanCompletedAt)}
+            {lastScanError
               ? translate(
                   'auto.components.stats.ClaudeUsagePane.2d41fd45c6',
                   ' • Last scan error: {{value0}}',
-                  { value0: scanState.lastScanError }
+                  { value0: lastScanError }
                 )
               : ''}
           </p>
@@ -207,14 +288,20 @@ export function ClaudeUsagePane(): React.JSX.Element {
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  onClick={() => void refreshClaudeUsage()}
-                  disabled={scanState.isScanning}
+                  onClick={() => {
+                    if (isRemote && remoteConnectionId) {
+                      void fetchClaudeUsageRemote(remoteConnectionId)
+                    } else {
+                      void refreshClaudeUsage()
+                    }
+                  }}
+                  disabled={isScanning}
                   aria-label={translate(
                     'auto.components.stats.ClaudeUsagePane.c5b9b344d0',
                     'Refresh Claude usage'
                   )}
                 >
-                  <RefreshCw className={`size-3.5 ${scanState.isScanning ? 'animate-spin' : ''}`} />
+                  <RefreshCw className={`size-3.5 ${isScanning ? 'animate-spin' : ''}`} />
                 </Button>
               </TooltipTrigger>
               <TooltipContent side="bottom" sideOffset={6}>
@@ -238,7 +325,28 @@ export function ClaudeUsagePane(): React.JSX.Element {
         </div>
       </div>
 
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-1.5">
+          <Server className="size-3.5 text-muted-foreground" />
+          <select
+            value={remoteConnectionId ?? ''}
+            onChange={(event) => handleRemoteTargetChange(event.target.value)}
+            className="h-7 rounded-md border border-border/60 bg-background px-2 text-xs text-foreground"
+            aria-label={translate(
+              'auto.components.stats.ClaudeUsagePane.remoteSourceLabel',
+              'Usage source'
+            )}
+          >
+            <option value="">
+              {translate('auto.components.stats.ClaudeUsagePane.thisMachine', 'This machine')}
+            </option>
+            {remoteTargets.map((target) => (
+              <option key={target.id} value={target.id}>
+                {target.label}
+              </option>
+            ))}
+          </select>
+        </div>
         <p className="text-xs text-muted-foreground">
           {SCOPE_OPTIONS.find((option) => option.value === scope)?.label} • {RANGE_LABELS[range]}
         </p>
@@ -246,81 +354,19 @@ export function ClaudeUsagePane(): React.JSX.Element {
 
       {!hasAnyData ? (
         <div className="rounded-lg border border-dashed border-border/60 bg-card/30 px-4 py-6 text-sm text-muted-foreground">
-          {translate(
-            'auto.components.stats.ClaudeUsagePane.7dde9331fd',
-            'No local Claude usage found yet for this scope.'
-          )}
+          {remoteTargets.length === 0 && isRemote
+            ? translate(
+                'auto.components.stats.ClaudeUsagePane.noConnectedServers',
+                'No connected remote server. Connect an SSH target to scan its usage.'
+              )
+            : translate(
+                'auto.components.stats.ClaudeUsagePane.7dde9331fd',
+                'No local Claude usage found yet for this scope.'
+              )}
         </div>
       ) : (
         <>
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <StatCard
-              label={translate('auto.components.stats.ClaudeUsagePane.ea71fae8fc', 'Input tokens')}
-              value={formatTokens(summary?.inputTokens ?? 0)}
-              icon={<Sparkles className="size-4" />}
-            />
-            <StatCard
-              label={translate('auto.components.stats.ClaudeUsagePane.2b8a2f14aa', 'Output tokens')}
-              value={formatTokens(summary?.outputTokens ?? 0)}
-              icon={<Activity className="size-4" />}
-            />
-            <StatCard
-              label={translate('auto.components.stats.ClaudeUsagePane.268cf0af51', 'Cache read')}
-              value={formatTokens(summary?.cacheReadTokens ?? 0)}
-              icon={<DatabaseZap className="size-4" />}
-            />
-            <StatCard
-              label={translate('auto.components.stats.ClaudeUsagePane.b786fb4a70', 'Cache write')}
-              value={formatTokens(summary?.cacheWriteTokens ?? 0)}
-              icon={<Waypoints className="size-4" />}
-            />
-            <StatCard
-              label={translate(
-                'auto.components.stats.ClaudeUsagePane.1634c4f404',
-                'Cache reuse rate'
-              )}
-              value={
-                summary?.cacheReuseRate !== null && summary?.cacheReuseRate !== undefined
-                  ? `${Math.round(summary.cacheReuseRate * 100)}%`
-                  : 'n/a'
-              }
-              icon={<Gauge className="size-4" />}
-            />
-            <StatCard
-              label={translate(
-                'auto.components.stats.ClaudeUsagePane.8cc23be4a3',
-                'Zero-cache-read turns'
-              )}
-              value={
-                summary && summary.turns > 0
-                  ? `${Math.round((summary.zeroCacheReadTurns / summary.turns) * 100)}%`
-                  : 'n/a'
-              }
-              icon={<DatabaseZap className="size-4" />}
-            />
-            <StatCard
-              label={translate(
-                'auto.components.stats.ClaudeUsagePane.0f3e696ca9',
-                'Sessions / Turns'
-              )}
-              value={`${(summary?.sessions ?? 0).toLocaleString()} / ${(summary?.turns ?? 0).toLocaleString()}`}
-              icon={<FolderKanban className="size-4" />}
-            />
-            <StatCard
-              label={translate(
-                'auto.components.stats.ClaudeUsagePane.b26d4ddb58',
-                'Est. API-equivalent cost'
-              )}
-              value={formatCost(summary?.estimatedCostUsd ?? null)}
-              icon={<Coins className="size-4" />}
-            />
-          </div>
-          <p className="px-1 text-xs text-muted-foreground">
-            {translate(
-              'auto.components.stats.ClaudeUsagePane.51ae85fa00',
-              'Cache reuse rate is calculated as cache read tokens / (input tokens + cache read tokens).'
-            )}
-          </p>
+          <ClaudeUsageStatCards summary={summary} />
 
           <ClaudeUsageDetails
             daily={daily}

@@ -16,8 +16,21 @@ import type {
 import type { AutomationRunUsage } from '../../shared/automations-types'
 import type { Store } from '../persistence'
 import { loadKnownUsageWorktreesByRepo, type UsageWorktreeRef } from '../usage-worktree-metadata'
-import type { ClaudeUsagePersistedState } from './types'
-import { createWorktreeRefs, getSessionProjectLabel, scanClaudeUsageFiles } from './scanner'
+import type {
+  ClaudeUsagePersistedState,
+  ClaudeUsagePersistedFile,
+  ClaudeUsageSession,
+  ClaudeUsageDailyAggregate
+} from './types'
+import type { IFilesystemProvider } from '../providers/types'
+import type { RemoteHostPlatform } from '../ssh/ssh-remote-platform'
+import {
+  createWorktreeRefs,
+  getSessionProjectLabel,
+  scanClaudeUsageFiles,
+  type ClaudeUsageWorktreeRef
+} from './scanner'
+import { scanClaudeUsageFilesRemote } from './remote-scanner'
 
 // Why: v5 widens Claude ownership keys (message-id / uuid fallbacks). Older
 // caches either lack ownership or used narrower keys and can under/over-count
@@ -313,6 +326,299 @@ function getWorktreeFingerprint(worktreesByRepo: Map<string, UsageWorktreeRef[]>
   return JSON.stringify(rows)
 }
 
+// Why: pure query helpers extracted from the store so the same summary/breakdown
+// logic serves both the persisted local scan and a transient remote scan result.
+function filterClaudeDailyAggregates(
+  dailyAggregates: ClaudeUsageDailyAggregate[],
+  scope: ClaudeUsageScope,
+  range: ClaudeUsageRange
+): ClaudeUsageDailyAggregate[] {
+  const cutoff = getRangeCutoff(range)
+  return dailyAggregates.filter((entry) => {
+    if (cutoff && entry.day < cutoff) {
+      return false
+    }
+    if (scope === 'orca' && entry.worktreeId === null) {
+      return false
+    }
+    return true
+  })
+}
+
+function filterClaudeUsageSessions(
+  sessions: ClaudeUsageSession[],
+  scope: ClaudeUsageScope,
+  range: ClaudeUsageRange
+): ClaudeUsageSession[] {
+  const cutoff = getRangeCutoff(range)
+  return sessions.filter((session) => {
+    // Why: daily aggregates use local calendar days, so session filtering has
+    // to use the same conversion or the sessions table/counts can disagree
+    // with the chart around UTC day boundaries.
+    const day = getLocalDay(session.lastTimestamp)
+    if (!day) {
+      return false
+    }
+    if (cutoff && day < cutoff) {
+      return false
+    }
+    if (scope === 'orca') {
+      return session.locationBreakdown.some((entry) => entry.worktreeId !== null)
+    }
+    return true
+  })
+}
+
+function buildClaudeUsageSummary(
+  sessions: ClaudeUsageSession[],
+  dailyAggregates: ClaudeUsageDailyAggregate[],
+  scope: ClaudeUsageScope,
+  range: ClaudeUsageRange
+): ClaudeUsageSummary {
+  const filteredDaily = filterClaudeDailyAggregates(dailyAggregates, scope, range)
+  const filteredSessions = filterClaudeUsageSessions(sessions, scope, range)
+
+  let inputTokens = 0
+  let outputTokens = 0
+  let cacheReadTokens = 0
+  let cacheWriteTokens = 0
+  let turns = 0
+  let zeroCacheReadTurns = 0
+  const byModel = new Map<string, number>()
+  const byProject = new Map<string, number>()
+  let estimatedCostUsd = 0
+  let hasAnyBillableCost = false
+
+  for (const row of filteredDaily) {
+    inputTokens += row.inputTokens
+    outputTokens += row.outputTokens
+    cacheReadTokens += row.cacheReadTokens
+    cacheWriteTokens += row.cacheWriteTokens
+    turns += row.turnCount
+    zeroCacheReadTurns += row.zeroCacheReadTurnCount
+    const modelKey = row.model ?? 'Unknown model'
+    byModel.set(modelKey, (byModel.get(modelKey) ?? 0) + row.inputTokens + row.outputTokens)
+    byProject.set(
+      row.projectLabel,
+      (byProject.get(row.projectLabel) ?? 0) + row.inputTokens + row.outputTokens
+    )
+    const cost = estimateCostUsd(
+      row.model,
+      row.inputTokens,
+      row.outputTokens,
+      row.cacheReadTokens,
+      row.cacheWriteTokens
+    )
+    if (cost !== null) {
+      hasAnyBillableCost = true
+      estimatedCostUsd += cost
+    }
+  }
+
+  const topModel = [...byModel.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? null
+  const topProject =
+    [...byProject.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? null
+
+  return {
+    scope,
+    range,
+    sessions: filteredSessions.length,
+    turns,
+    zeroCacheReadTurns,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    cacheReuseRate:
+      inputTokens + cacheReadTokens > 0 ? cacheReadTokens / (inputTokens + cacheReadTokens) : null,
+    estimatedCostUsd: hasAnyBillableCost ? estimatedCostUsd : null,
+    topModel,
+    topProject,
+    hasAnyClaudeData: filteredSessions.length > 0 || filteredDaily.length > 0
+  }
+}
+
+function buildClaudeUsageDaily(
+  dailyAggregates: ClaudeUsageDailyAggregate[],
+  scope: ClaudeUsageScope,
+  range: ClaudeUsageRange
+): ClaudeUsageDailyPoint[] {
+  const byDay = new Map<string, ClaudeUsageDailyPoint>()
+  for (const row of filterClaudeDailyAggregates(dailyAggregates, scope, range)) {
+    const existing = byDay.get(row.day) ?? {
+      day: row.day,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0
+    }
+    existing.inputTokens += row.inputTokens
+    existing.outputTokens += row.outputTokens
+    existing.cacheReadTokens += row.cacheReadTokens
+    existing.cacheWriteTokens += row.cacheWriteTokens
+    byDay.set(row.day, existing)
+  }
+  return [...byDay.values()].sort((left, right) => left.day.localeCompare(right.day))
+}
+
+function buildClaudeUsageBreakdown(
+  sessions: ClaudeUsageSession[],
+  dailyAggregates: ClaudeUsageDailyAggregate[],
+  scope: ClaudeUsageScope,
+  range: ClaudeUsageRange,
+  kind: ClaudeUsageBreakdownKind
+): ClaudeUsageBreakdownRow[] {
+  const rows = new Map<string, ClaudeUsageBreakdownRow>()
+  const filteredDaily = filterClaudeDailyAggregates(dailyAggregates, scope, range)
+  const filteredSessions = filterClaudeUsageSessions(sessions, scope, range)
+
+  for (const daily of filteredDaily) {
+    const key = kind === 'model' ? (daily.model ?? 'unknown') : daily.projectKey
+    const label = kind === 'model' ? (daily.model ?? 'Unknown model') : daily.projectLabel
+    const existing = rows.get(key) ?? {
+      key,
+      label,
+      sessions: 0,
+      turns: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      estimatedCostUsd: null
+    }
+    existing.turns += daily.turnCount
+    existing.inputTokens += daily.inputTokens
+    existing.outputTokens += daily.outputTokens
+    existing.cacheReadTokens += daily.cacheReadTokens
+    existing.cacheWriteTokens += daily.cacheWriteTokens
+    rows.set(key, existing)
+  }
+
+  for (const session of filteredSessions) {
+    if (kind === 'model') {
+      const key = session.model ?? 'unknown'
+      const row = rows.get(key)
+      if (row) {
+        row.sessions++
+      }
+      continue
+    }
+    const matchingLocations = session.locationBreakdown.filter((entry) =>
+      scope === 'all' ? true : entry.worktreeId !== null
+    )
+    const seen = new Set<string>()
+    for (const location of matchingLocations) {
+      if (seen.has(location.locationKey)) {
+        continue
+      }
+      seen.add(location.locationKey)
+      const row = rows.get(location.locationKey)
+      if (row) {
+        row.sessions++
+      }
+    }
+  }
+
+  for (const row of rows.values()) {
+    if (kind === 'model') {
+      row.estimatedCostUsd = estimateCostUsd(
+        row.key,
+        row.inputTokens,
+        row.outputTokens,
+        row.cacheReadTokens,
+        row.cacheWriteTokens
+      )
+    }
+  }
+
+  return [...rows.values()].sort((left, right) => {
+    const leftTotal = left.inputTokens + left.outputTokens
+    const rightTotal = right.inputTokens + right.outputTokens
+    return rightTotal - leftTotal
+  })
+}
+
+function buildClaudeUsageRecentSessions(
+  sessions: ClaudeUsageSession[],
+  scope: ClaudeUsageScope,
+  range: ClaudeUsageRange,
+  limit = 12
+): ClaudeUsageSessionRow[] {
+  return filterClaudeUsageSessions(sessions, scope, range)
+    .slice(0, limit)
+    .map((session) => {
+      const matchingLocations = session.locationBreakdown.filter((entry) =>
+        scope === 'all' ? true : entry.worktreeId !== null
+      )
+      const scopedLocations =
+        matchingLocations.length > 0 ? matchingLocations : session.locationBreakdown
+      const totals = scopedLocations.reduce(
+        (acc, entry) => {
+          acc.turns += entry.turnCount
+          acc.inputTokens += entry.inputTokens
+          acc.outputTokens += entry.outputTokens
+          acc.cacheReadTokens += entry.cacheReadTokens
+          acc.cacheWriteTokens += entry.cacheWriteTokens
+          return acc
+        },
+        {
+          turns: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0
+        }
+      )
+      const durationMinutes = Math.max(
+        0,
+        Math.round(
+          (new Date(session.lastTimestamp).getTime() -
+            new Date(session.firstTimestamp).getTime()) /
+            60_000
+        )
+      )
+      return {
+        sessionId: session.sessionId,
+        lastActiveAt: session.lastTimestamp,
+        durationMinutes,
+        projectLabel: getSessionProjectLabel(scopedLocations),
+        branch: session.lastGitBranch,
+        model: session.model,
+        turns: totals.turns,
+        inputTokens: totals.inputTokens,
+        outputTokens: totals.outputTokens,
+        cacheReadTokens: totals.cacheReadTokens,
+        cacheWriteTokens: totals.cacheWriteTokens
+      }
+    })
+}
+
+// Why: renders a remote (in-memory) scan result through the same query pipeline
+// as the persisted local store, so the renderer needs no separate code path.
+export function buildClaudeUsageSnapshotFromScan(
+  result: { sessions: ClaudeUsageSession[]; dailyAggregates: ClaudeUsageDailyAggregate[] },
+  scope: ClaudeUsageScope,
+  range: ClaudeUsageRange,
+  recentSessionLimit = 10
+): ClaudeUsageSnapshot {
+  const { sessions, dailyAggregates } = result
+  return {
+    scanState: {
+      enabled: true,
+      isScanning: false,
+      lastScanStartedAt: Date.now(),
+      lastScanCompletedAt: Date.now(),
+      lastScanError: null,
+      hasAnyClaudeData: sessions.length > 0 || dailyAggregates.length > 0
+    },
+    summary: buildClaudeUsageSummary(sessions, dailyAggregates, scope, range),
+    daily: buildClaudeUsageDaily(dailyAggregates, scope, range),
+    modelBreakdown: buildClaudeUsageBreakdown(sessions, dailyAggregates, scope, range, 'model'),
+    projectBreakdown: buildClaudeUsageBreakdown(sessions, dailyAggregates, scope, range, 'project'),
+    recentSessions: buildClaudeUsageRecentSessions(sessions, scope, range, recentSessionLimit)
+  }
+}
+
 export class ClaudeUsageStore {
   private state: ClaudeUsagePersistedState
   private readonly store: Store
@@ -462,73 +768,7 @@ export class ClaudeUsageStore {
   }
 
   private buildSummary(scope: ClaudeUsageScope, range: ClaudeUsageRange): ClaudeUsageSummary {
-    const filteredDaily = this.getFilteredDaily(scope, range)
-    const filteredSessions = this.getFilteredSessions(scope, range)
-
-    let inputTokens = 0
-    let outputTokens = 0
-    let cacheReadTokens = 0
-    let cacheWriteTokens = 0
-    let turns = 0
-    let zeroCacheReadTurns = 0
-    const byModel = new Map<string, number>()
-    const byProject = new Map<string, number>()
-    let estimatedCostUsd = 0
-    let hasAnyBillableCost = false
-
-    for (const row of filteredDaily) {
-      inputTokens += row.inputTokens
-      outputTokens += row.outputTokens
-      cacheReadTokens += row.cacheReadTokens
-      cacheWriteTokens += row.cacheWriteTokens
-      turns += row.turnCount
-      zeroCacheReadTurns += row.zeroCacheReadTurnCount
-      const modelKey = row.model ?? 'Unknown model'
-      byModel.set(modelKey, (byModel.get(modelKey) ?? 0) + row.inputTokens + row.outputTokens)
-      byProject.set(
-        row.projectLabel,
-        (byProject.get(row.projectLabel) ?? 0) + row.inputTokens + row.outputTokens
-      )
-      const cost = estimateCostUsd(
-        row.model,
-        row.inputTokens,
-        row.outputTokens,
-        row.cacheReadTokens,
-        row.cacheWriteTokens
-      )
-      if (cost !== null) {
-        hasAnyBillableCost = true
-        estimatedCostUsd += cost
-      }
-    }
-
-    const topModel =
-      [...byModel.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? null
-    const topProject =
-      [...byProject.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? null
-
-    return {
-      scope,
-      range,
-      sessions: filteredSessions.length,
-      turns,
-      zeroCacheReadTurns,
-      inputTokens,
-      outputTokens,
-      cacheReadTokens,
-      cacheWriteTokens,
-      cacheReuseRate:
-        inputTokens + cacheReadTokens > 0
-          ? cacheReadTokens / (inputTokens + cacheReadTokens)
-          : null,
-      estimatedCostUsd: hasAnyBillableCost ? estimatedCostUsd : null,
-      topModel,
-      topProject,
-      // Why: the empty-state UX is scope/range specific. Using global persisted
-      // data here makes the Orca-only view render empty charts instead of the
-      // intended "no usage for this scope" message when only off-Orca logs exist.
-      hasAnyClaudeData: filteredSessions.length > 0 || filteredDaily.length > 0
-    }
+    return buildClaudeUsageSummary(this.state.sessions, this.state.dailyAggregates, scope, range)
   }
 
   async getDaily(
@@ -540,22 +780,7 @@ export class ClaudeUsageStore {
   }
 
   private buildDaily(scope: ClaudeUsageScope, range: ClaudeUsageRange): ClaudeUsageDailyPoint[] {
-    const byDay = new Map<string, ClaudeUsageDailyPoint>()
-    for (const row of this.getFilteredDaily(scope, range)) {
-      const existing = byDay.get(row.day) ?? {
-        day: row.day,
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0
-      }
-      existing.inputTokens += row.inputTokens
-      existing.outputTokens += row.outputTokens
-      existing.cacheReadTokens += row.cacheReadTokens
-      existing.cacheWriteTokens += row.cacheWriteTokens
-      byDay.set(row.day, existing)
-    }
-    return [...byDay.values()].sort((left, right) => left.day.localeCompare(right.day))
+    return buildClaudeUsageDaily(this.state.dailyAggregates, scope, range)
   }
 
   async getBreakdown(
@@ -572,74 +797,13 @@ export class ClaudeUsageStore {
     range: ClaudeUsageRange,
     kind: ClaudeUsageBreakdownKind
   ): ClaudeUsageBreakdownRow[] {
-    const rows = new Map<string, ClaudeUsageBreakdownRow>()
-    const filteredDaily = this.getFilteredDaily(scope, range)
-    const filteredSessions = this.getFilteredSessions(scope, range)
-
-    for (const daily of filteredDaily) {
-      const key = kind === 'model' ? (daily.model ?? 'unknown') : daily.projectKey
-      const label = kind === 'model' ? (daily.model ?? 'Unknown model') : daily.projectLabel
-      const existing = rows.get(key) ?? {
-        key,
-        label,
-        sessions: 0,
-        turns: 0,
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0,
-        estimatedCostUsd: null
-      }
-      existing.turns += daily.turnCount
-      existing.inputTokens += daily.inputTokens
-      existing.outputTokens += daily.outputTokens
-      existing.cacheReadTokens += daily.cacheReadTokens
-      existing.cacheWriteTokens += daily.cacheWriteTokens
-      rows.set(key, existing)
-    }
-
-    for (const session of filteredSessions) {
-      if (kind === 'model') {
-        const key = session.model ?? 'unknown'
-        const row = rows.get(key)
-        if (row) {
-          row.sessions++
-        }
-        continue
-      }
-      const matchingLocations = session.locationBreakdown.filter((entry) =>
-        scope === 'all' ? true : entry.worktreeId !== null
-      )
-      const seen = new Set<string>()
-      for (const location of matchingLocations) {
-        if (seen.has(location.locationKey)) {
-          continue
-        }
-        seen.add(location.locationKey)
-        const row = rows.get(location.locationKey)
-        if (row) {
-          row.sessions++
-        }
-      }
-    }
-
-    for (const row of rows.values()) {
-      if (kind === 'model') {
-        row.estimatedCostUsd = estimateCostUsd(
-          row.key,
-          row.inputTokens,
-          row.outputTokens,
-          row.cacheReadTokens,
-          row.cacheWriteTokens
-        )
-      }
-    }
-
-    return [...rows.values()].sort((left, right) => {
-      const leftTotal = left.inputTokens + left.outputTokens
-      const rightTotal = right.inputTokens + right.outputTokens
-      return rightTotal - leftTotal
-    })
+    return buildClaudeUsageBreakdown(
+      this.state.sessions,
+      this.state.dailyAggregates,
+      scope,
+      range,
+      kind
+    )
   }
 
   async getRecentSessions(
@@ -656,53 +820,34 @@ export class ClaudeUsageStore {
     range: ClaudeUsageRange,
     limit = 12
   ): ClaudeUsageSessionRow[] {
-    return this.getFilteredSessions(scope, range)
-      .slice(0, limit)
-      .map((session) => {
-        const matchingLocations = session.locationBreakdown.filter((entry) =>
-          scope === 'all' ? true : entry.worktreeId !== null
-        )
-        const scopedLocations =
-          matchingLocations.length > 0 ? matchingLocations : session.locationBreakdown
-        const totals = scopedLocations.reduce(
-          (acc, entry) => {
-            acc.turns += entry.turnCount
-            acc.inputTokens += entry.inputTokens
-            acc.outputTokens += entry.outputTokens
-            acc.cacheReadTokens += entry.cacheReadTokens
-            acc.cacheWriteTokens += entry.cacheWriteTokens
-            return acc
-          },
-          {
-            turns: 0,
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheReadTokens: 0,
-            cacheWriteTokens: 0
-          }
-        )
-        const durationMinutes = Math.max(
-          0,
-          Math.round(
-            (new Date(session.lastTimestamp).getTime() -
-              new Date(session.firstTimestamp).getTime()) /
-              60_000
-          )
-        )
-        return {
-          sessionId: session.sessionId,
-          lastActiveAt: session.lastTimestamp,
-          durationMinutes,
-          projectLabel: getSessionProjectLabel(scopedLocations),
-          branch: session.lastGitBranch,
-          model: session.model,
-          turns: totals.turns,
-          inputTokens: totals.inputTokens,
-          outputTokens: totals.outputTokens,
-          cacheReadTokens: totals.cacheReadTokens,
-          cacheWriteTokens: totals.cacheWriteTokens
-        }
-      })
+    return buildClaudeUsageRecentSessions(this.state.sessions, scope, range, limit)
+  }
+
+  // Why: in-memory per-host processed-file cache so repeated remote scans only
+  // re-stat unchanged transcripts over SSH instead of reparsing them. Not
+  // persisted: a restart pays one stat pass, which is cheap.
+  private readonly remoteProcessedFilesByHost = new Map<string, ClaudeUsagePersistedFile[]>()
+
+  async scanRemote(args: {
+    executionHostId: string
+    provider: IFilesystemProvider
+    remoteHome: string
+    hostPlatform: RemoteHostPlatform
+    worktrees: ClaudeUsageWorktreeRef[]
+    scope: ClaudeUsageScope
+    range: ClaudeUsageRange
+    recentSessionLimit?: number
+  }): Promise<ClaudeUsageSnapshot> {
+    const previous = this.remoteProcessedFilesByHost.get(args.executionHostId) ?? []
+    const result = await scanClaudeUsageFilesRemote({
+      provider: args.provider,
+      remoteHome: args.remoteHome,
+      hostPlatform: args.hostPlatform,
+      worktrees: args.worktrees,
+      previousProcessedFiles: previous
+    })
+    this.remoteProcessedFilesByHost.set(args.executionHostId, result.processedFiles)
+    return buildClaudeUsageSnapshotFromScan(result, args.scope, args.range, args.recentSessionLimit)
   }
 
   async getAutomationRunUsage(input: AutomationUsageLookupInput): Promise<AutomationRunUsage> {
@@ -820,39 +965,6 @@ export class ClaudeUsageStore {
       unavailableReason: null,
       unavailableMessage: null
     }
-  }
-
-  private getFilteredDaily(scope: ClaudeUsageScope, range: ClaudeUsageRange) {
-    const cutoff = getRangeCutoff(range)
-    return this.state.dailyAggregates.filter((entry) => {
-      if (cutoff && entry.day < cutoff) {
-        return false
-      }
-      if (scope === 'orca' && entry.worktreeId === null) {
-        return false
-      }
-      return true
-    })
-  }
-
-  private getFilteredSessions(scope: ClaudeUsageScope, range: ClaudeUsageRange) {
-    const cutoff = getRangeCutoff(range)
-    return this.state.sessions.filter((session) => {
-      // Why: daily aggregates use local calendar days, so session filtering has
-      // to use the same conversion or the sessions table/counts can disagree
-      // with the chart around UTC day boundaries.
-      const day = getLocalDay(session.lastTimestamp)
-      if (!day) {
-        return false
-      }
-      if (cutoff && day < cutoff) {
-        return false
-      }
-      if (scope === 'orca') {
-        return session.locationBreakdown.some((entry) => entry.worktreeId !== null)
-      }
-      return true
-    })
   }
 
   private shouldForceAutomationUsageScan(completedAt: number): boolean {
