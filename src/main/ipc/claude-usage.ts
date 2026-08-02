@@ -1,12 +1,37 @@
 import { ipcMain } from 'electron'
 import type { ClaudeUsageStore } from '../claude-usage/store'
+import type { ClaudeUsageWorktreeRef } from '../claude-usage/scanner'
+import type { IFilesystemProvider } from '../providers/types'
+import {
+  SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE
+} from '../providers/ssh-filesystem-dispatch'
+import type { RemoteHostPlatform } from '../ssh/ssh-remote-platform'
 import type {
   ClaudeUsageBreakdownKind,
   ClaudeUsageRange,
   ClaudeUsageScope
 } from '../../shared/claude-usage-types'
 
-export function registerClaudeUsageHandlers(claudeUsage: ClaudeUsageStore): void {
+export type ClaudeUsageRemoteScanContext = {
+  executionHostId: string
+  provider: IFilesystemProvider
+  remoteHome: string
+  hostPlatform: RemoteHostPlatform
+  worktrees: ClaudeUsageWorktreeRef[]
+}
+
+export type ClaudeUsageRemoteScanResolver = (
+  connectionId: string
+) => ClaudeUsageRemoteScanContext | null
+
+export type ClaudeUsageHandlerOptions = {
+  resolveRemoteScanContext?: ClaudeUsageRemoteScanResolver
+}
+
+export function registerClaudeUsageHandlers(
+  claudeUsage: ClaudeUsageStore,
+  options: ClaudeUsageHandlerOptions = {}
+): void {
   ipcMain.handle('claudeUsage:getScanState', () => claudeUsage.getScanState())
   ipcMain.handle('claudeUsage:setEnabled', (_event, args: { enabled: boolean }) =>
     claudeUsage.setEnabled(args.enabled)
@@ -40,5 +65,33 @@ export function registerClaudeUsageHandlers(claudeUsage: ClaudeUsageStore): void
     'claudeUsage:getRecentSessions',
     (_event, args: { scope: ClaudeUsageScope; range: ClaudeUsageRange; limit?: number }) =>
       claudeUsage.getRecentSessions(args.scope, args.range, args.limit)
+  )
+  ipcMain.handle(
+    'claudeUsage:scanRemote',
+    async (
+      _event,
+      args: { connectionId: string; scope: ClaudeUsageScope; range: ClaudeUsageRange }
+    ) => {
+      if (!options.resolveRemoteScanContext) {
+        return { ok: false, error: 'Remote usage scanning is not available.' } as const
+      }
+      const context = options.resolveRemoteScanContext(args.connectionId)
+      if (!context) {
+        return { ok: false, error: SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE } as const
+      }
+      try {
+        const snapshot = await claudeUsage.scanRemote({
+          ...context,
+          scope: args.scope,
+          range: args.range
+        })
+        return { ok: true, snapshot } as const
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        } as const
+      }
+    }
   )
 }

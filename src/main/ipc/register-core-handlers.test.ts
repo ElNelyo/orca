@@ -482,7 +482,9 @@ describe('registerCoreHandlers', () => {
       result: { sessions: 'bad-shape' }
     })
 
-    expect(registerClaudeUsageHandlersMock).toHaveBeenCalledWith(claudeUsage)
+    expect(registerClaudeUsageHandlersMock).toHaveBeenCalledWith(claudeUsage, {
+      resolveRemoteScanContext: expect.any(Function)
+    })
     expect(registerCodexUsageHandlersMock).toHaveBeenCalledWith(codexUsage)
     expect(registerOpenCodeUsageHandlersMock).toHaveBeenCalledWith(openCodeUsage)
     expect(registerAppHandlersMock).toHaveBeenCalledWith(store, { onBeforeRelaunch })

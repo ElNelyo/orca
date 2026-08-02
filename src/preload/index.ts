@@ -3912,7 +3912,9 @@ const api = {
     getBreakdown: (args: { scope: string; range: string; kind: string }): Promise<unknown> =>
       ipcRenderer.invoke('claudeUsage:getBreakdown', args),
     getRecentSessions: (args: { scope: string; range: string; limit?: number }): Promise<unknown> =>
-      ipcRenderer.invoke('claudeUsage:getRecentSessions', args)
+      ipcRenderer.invoke('claudeUsage:getRecentSessions', args),
+    scanRemote: (args: { connectionId: string; scope: string; range: string }): Promise<unknown> =>
+      ipcRenderer.invoke('claudeUsage:scanRemote', args)
   },
 
   codexUsage: {

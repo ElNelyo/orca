@@ -388,7 +388,8 @@ import type {
   ClaudeUsageScope,
   ClaudeUsageSessionRow,
   ClaudeUsageSnapshot,
-  ClaudeUsageSummary
+  ClaudeUsageSummary,
+  ClaudeUsageRemoteScanResult
 } from '../shared/claude-usage-types'
 import type {
   CodexRateLimitResetResult,
@@ -782,6 +783,11 @@ export type ClaudeUsageApi = {
     range: ClaudeUsageRange
     limit?: number
   }) => Promise<ClaudeUsageSessionRow[]>
+  scanRemote: (args: {
+    connectionId: string
+    scope: ClaudeUsageScope
+    range: ClaudeUsageRange
+  }) => Promise<ClaudeUsageRemoteScanResult>
 }
 
 export type CodexUsageApi = {

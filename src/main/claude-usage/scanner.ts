@@ -1,9 +1,7 @@
 /* eslint-disable max-lines -- Why: transcript discovery, parsing, attribution, and aggregation share one data shape pipeline. Keeping them co-located makes it easier to audit correctness when Claude usage numbers look surprising. */
 import { homedir } from 'node:os'
 import { join, basename } from 'node:path'
-import { realpath, readdir, stat } from 'node:fs/promises'
-import { createReadStream } from 'node:fs'
-import { createInterface } from 'node:readline'
+import { localUsageFilesystem, type UsageFilesystem } from './usage-filesystem'
 import type { Repo } from '../../shared/types'
 import type {
   ClaudeUsageAttributedTurn,
@@ -20,6 +18,14 @@ export type ClaudeUsageWorktreeRef = {
   worktreeId: string
   path: string
   displayName: string
+}
+
+// Why: decouples the transcript scan from node:fs so the same parser runs
+// against either the local disk (default) or a remote SSH filesystem, which is
+// what lets Stats & Usage cover Remote Server agent runs.
+export type ClaudeUsageScanContext = {
+  filesystem: UsageFilesystem
+  roots: string[]
 }
 
 type ClaudeUsageSourceRecord = {
@@ -71,9 +77,12 @@ function getDefaultProjectLabel(cwd: string | null): string {
   return parts.at(-1) ?? cwd
 }
 
-async function canonicalizePath(pathValue: string): Promise<string> {
+async function canonicalizePath(
+  pathValue: string,
+  fs: UsageFilesystem = localUsageFilesystem
+): Promise<string> {
   try {
-    const resolved = await realpath(pathValue)
+    const resolved = await fs.realpath(pathValue)
     return normalizeComparablePath(resolved)
   } catch {
     return normalizeComparablePath(pathValue)
@@ -128,17 +137,17 @@ async function yieldToEventLoop(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-async function walkJsonlFiles(dirPath: string): Promise<string[]> {
-  const entries = await readdir(dirPath, { withFileTypes: true })
+async function walkJsonlFiles(dirPath: string, fs: UsageFilesystem): Promise<string[]> {
+  const entries = await fs.readDir(dirPath)
   const files: string[] = []
 
   for (const entry of entries) {
     const fullPath = join(dirPath, entry.name)
-    if (entry.isDirectory()) {
-      appendDiscoveredFiles(files, await walkJsonlFiles(fullPath))
+    if (entry.isDirectory) {
+      appendDiscoveredFiles(files, await walkJsonlFiles(fullPath, fs))
       continue
     }
-    if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+    if (entry.isFile && entry.name.endsWith('.jsonl')) {
       files.push(fullPath)
     }
   }
@@ -154,12 +163,15 @@ function appendDiscoveredFiles(target: string[], source: readonly string[]): voi
   }
 }
 
-export async function listClaudeTranscriptFiles(): Promise<string[]> {
-  const roots = [CLAUDE_PROJECTS_DIR, CLAUDE_TRANSCRIPTS_DIR]
+export async function listClaudeTranscriptFiles(
+  context?: ClaudeUsageScanContext
+): Promise<string[]> {
+  const roots = context?.roots ?? [CLAUDE_PROJECTS_DIR, CLAUDE_TRANSCRIPTS_DIR]
+  const fs = context?.filesystem ?? localUsageFilesystem
   const files = await Promise.all(
     roots.map(async (root) => {
       try {
-        return await walkJsonlFiles(root)
+        return await walkJsonlFiles(root, fs)
       } catch {
         return []
       }
@@ -168,13 +180,13 @@ export async function listClaudeTranscriptFiles(): Promise<string[]> {
   return [...new Set(files.flat())].sort()
 }
 
-export async function getProcessedFileInfo(filePath: string): Promise<ClaudeUsageProcessedFile> {
-  const fileStat = await stat(filePath)
+export async function getProcessedFileInfo(
+  filePath: string,
+  fs: UsageFilesystem = localUsageFilesystem
+): Promise<ClaudeUsageProcessedFile> {
+  const fileStat = await fs.stat(filePath)
   let lineCount = 0
-  const lines = createInterface({
-    input: createReadStream(filePath, { encoding: 'utf-8' }),
-    crlfDelay: Infinity
-  })
+  const lines = await fs.readLines(filePath)
   for await (const _line of lines) {
     lineCount++
   }
@@ -187,9 +199,10 @@ export async function getProcessedFileInfo(filePath: string): Promise<ClaudeUsag
 }
 
 async function getProcessedFileStat(
-  filePath: string
+  filePath: string,
+  fs: UsageFilesystem
 ): Promise<Omit<ClaudeUsageProcessedFile, 'lineCount'>> {
-  const fileStat = await stat(filePath)
+  const fileStat = await fs.stat(filePath)
   return {
     path: filePath,
     mtimeMs: fileStat.mtimeMs,
@@ -308,13 +321,13 @@ export function parseClaudeUsageRecord(line: string): ClaudeUsageParsedTurn | nu
   return parsed ? stripClaudeSourceMetadata(parsed) : null
 }
 
-export async function parseClaudeUsageFile(filePath: string): Promise<ClaudeUsageParsedTurn[]> {
+export async function parseClaudeUsageFile(
+  filePath: string,
+  fs: UsageFilesystem = localUsageFilesystem
+): Promise<ClaudeUsageParsedTurn[]> {
   const turns: ClaudeUsageParsedSourceTurn[] = []
   const fallbackSessionId = basename(filePath, '.jsonl')
-  const lines = createInterface({
-    input: createReadStream(filePath, { encoding: 'utf-8' }),
-    crlfDelay: Infinity
-  })
+  const lines = await fs.readLines(filePath)
 
   for await (const line of lines) {
     const parsed = parseClaudeUsageSourceRecord(line, fallbackSessionId)
@@ -326,18 +339,18 @@ export async function parseClaudeUsageFile(filePath: string): Promise<ClaudeUsag
   return dedupeClaudeUsageTurns(turns).map(stripClaudeSourceMetadata)
 }
 
-async function readClaudeUsageScanFile(filePath: string): Promise<{
+async function readClaudeUsageScanFile(
+  filePath: string,
+  fs: UsageFilesystem
+): Promise<{
   processedFile: ClaudeUsageProcessedFile
   turns: ClaudeUsageParsedSourceTurn[]
 }> {
-  const fileStat = await stat(filePath)
+  const fileStat = await fs.stat(filePath)
   let lineCount = 0
   const turns: ClaudeUsageParsedSourceTurn[] = []
   const fallbackSessionId = basename(filePath, '.jsonl')
-  const lines = createInterface({
-    input: createReadStream(filePath, { encoding: 'utf-8' }),
-    crlfDelay: Infinity
-  })
+  const lines = await fs.readLines(filePath)
 
   for await (const line of lines) {
     lineCount++
@@ -370,18 +383,20 @@ function localDayFromTimestamp(timestamp: string): string | null {
 }
 
 export async function buildWorktreeLookup(
-  worktrees: ClaudeUsageWorktreeRef[]
+  worktrees: ClaudeUsageWorktreeRef[],
+  fs: UsageFilesystem = localUsageFilesystem
 ): Promise<Map<string, ClaudeUsageWorktreeRef>> {
   const lookup = new Map<string, ClaudeUsageWorktreeRef>()
   for (const worktree of worktrees) {
-    lookup.set(await canonicalizePath(worktree.path), worktree)
+    lookup.set(await canonicalizePath(worktree.path, fs), worktree)
   }
   return lookup
 }
 
 export async function attributeClaudeUsageTurns(
   turns: ClaudeUsageParsedTurn[],
-  worktreeLookup: Map<string, ClaudeUsageWorktreeRef>
+  worktreeLookup: Map<string, ClaudeUsageWorktreeRef>,
+  fs: UsageFilesystem = localUsageFilesystem
 ): Promise<ClaudeUsageAttributedTurn[]> {
   const attributed: ClaudeUsageAttributedTurn[] = []
   const canonicalCwdByPath = new Map<string, string>()
@@ -402,7 +417,7 @@ export async function attributeClaudeUsageTurns(
       if (canonicalCwd === undefined) {
         // Why: Claude transcripts repeat the same cwd for many consecutive
         // turns. Cache realpath work so attribution scales with unique paths.
-        canonicalCwd = await canonicalizePath(turn.cwd)
+        canonicalCwd = await canonicalizePath(turn.cwd, fs)
         canonicalCwdByPath.set(turn.cwd, canonicalCwd)
       }
       const worktree = findContainingWorktree(canonicalCwd, worktreeLookup)
@@ -620,15 +635,17 @@ export function aggregateClaudeUsage(turns: ClaudeUsageAttributedTurn[]): {
 
 export async function scanClaudeUsageFiles(
   worktrees: ClaudeUsageWorktreeRef[],
-  previousProcessedFiles: ClaudeUsagePersistedFile[] = []
+  previousProcessedFiles: ClaudeUsagePersistedFile[] = [],
+  context?: ClaudeUsageScanContext
 ): Promise<{
   processedFiles: ClaudeUsagePersistedFile[]
   sessions: ClaudeUsageSession[]
   dailyAggregates: ClaudeUsageDailyAggregate[]
 }> {
-  const files = await listClaudeTranscriptFiles()
+  const filesystem = context?.filesystem ?? localUsageFilesystem
+  const files = await listClaudeTranscriptFiles(context)
   const previousByPath = new Map(previousProcessedFiles.map((file) => [file.path, file]))
-  const worktreeLookup = await buildWorktreeLookup(worktrees)
+  const worktreeLookup = await buildWorktreeLookup(worktrees, filesystem)
 
   const currentPaths = new Set(files)
   // Why: when a file that owned dedupe keys is deleted, remaining forks still
@@ -648,7 +665,7 @@ export async function scanClaudeUsageFiles(
     const batch = files.slice(index, index + FILE_SCAN_BATCH_SIZE)
     const reusable = await Promise.all(
       batch.map(async (filePath) => {
-        const fileInfo = await getProcessedFileStat(filePath)
+        const fileInfo = await getProcessedFileStat(filePath, filesystem)
         const previous = previousByPath.get(filePath)
         // Why: Claude histories can be gigabytes. Unchanged files should pay
         // only stat cost on refresh while preserving exactly the old projection.
@@ -698,7 +715,9 @@ export async function scanClaudeUsageFiles(
     const batch = pathsToParse.slice(index, index + FILE_SCAN_BATCH_SIZE)
     // Why: transcript scans run in Electron's main process. Small parallel
     // batches cut independent file I/O without letting Settings stay blocked.
-    const reads = await Promise.all(batch.map((filePath) => readClaudeUsageScanFile(filePath)))
+    const reads = await Promise.all(
+      batch.map((filePath) => readClaudeUsageScanFile(filePath, filesystem))
+    )
     for (const [batchIndex, filePath] of batch.entries()) {
       const { processedFile, turns } = reads[batchIndex]
       // Why: ownership claims must be sequential in sorted-path order so
@@ -718,7 +737,7 @@ export async function scanClaudeUsageFiles(
         }
         ownedTurns.push(stripClaudeSourceMetadata(turn))
       }
-      const attributed = await attributeClaudeUsageTurns(ownedTurns, worktreeLookup)
+      const attributed = await attributeClaudeUsageTurns(ownedTurns, worktreeLookup, filesystem)
       parsedByPath.set(filePath, {
         ...processedFile,
         ...aggregateClaudeUsage(attributed),

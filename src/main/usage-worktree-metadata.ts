@@ -60,3 +60,52 @@ export function loadKnownUsageWorktreesByRepo(
 
   return worktreesByRepo
 }
+
+// Why: mirrors loadKnownUsageWorktreesByRepo but for the SSH repos of one
+// connection, whose worktree paths live on the remote host and must match the
+// remote transcripts' cwd during remote usage attribution.
+export function loadRemoteUsageWorktreesForConnection(
+  store: Pick<Store, 'getAllWorktreeMeta'>,
+  repos: Repo[],
+  connectionId: string
+): Map<string, UsageWorktreeRef[]> {
+  const remoteRepos = repos.filter((repo) => repo.connectionId === connectionId)
+  const repoIds = new Set(remoteRepos.map((repo) => repo.id))
+  const worktreesByRepo = new Map<string, UsageWorktreeRef[]>()
+  const seenPathsByRepo = new Map<string, Set<string>>()
+
+  for (const repo of remoteRepos) {
+    worktreesByRepo.set(repo.id, [
+      {
+        worktreeId: `${repo.id}::${repo.path}`,
+        path: repo.path,
+        displayName: repo.displayName || getDefaultUsageWorktreeLabel(repo.path)
+      }
+    ])
+    seenPathsByRepo.set(repo.id, new Set([repo.path]))
+  }
+
+  for (const [worktreeId, meta] of Object.entries(store.getAllWorktreeMeta())) {
+    const parsed = splitWorktreeId(worktreeId)
+    if (!parsed || !repoIds.has(parsed.repoId)) {
+      continue
+    }
+    const repo = remoteRepos.find((item) => item.id === parsed.repoId)
+    const worktreePath =
+      repo && isFolderRepo(repo)
+        ? (splitWorktreeIdForFilesystem(worktreeId)?.worktreePath ?? parsed.worktreePath)
+        : parsed.worktreePath
+    const seenPaths = seenPathsByRepo.get(parsed.repoId)
+    if (seenPaths?.has(worktreePath)) {
+      continue
+    }
+    seenPaths?.add(worktreePath)
+    worktreesByRepo.get(parsed.repoId)?.push({
+      worktreeId,
+      path: worktreePath,
+      displayName: meta.displayName || getDefaultUsageWorktreeLabel(worktreePath)
+    })
+  }
+
+  return worktreesByRepo
+}
